@@ -1,0 +1,61 @@
+{
+  "description": "Report the Codex session's status and title to GenTerminal over OSC 9999 (`genterm-notify`). GenTerminal's sidebar Sessions section joins on the payload's tmux.session to rename the managed record (consent: the record was created with Launch Codex) and lights the unread dot on activity. Reports fire on SessionStart (started/resumed/cleared status), UserPromptSubmit (turn started + the title derived from the first user prompt), Stop (turn complete + turn count) and SessionEnd (session ended). PostToolUse re-reports only when the TITLE changed (a mid-turn rename or the first derived title), never for plain activity — every tool call would otherwise spam the inbox. Every handler is python3-gated and never blocks the agent: short timeouts, PostToolUse async, report.py always exits 0. Titles resolve custom-first (the user's Rename chat, read from $CODEX_HOME/session_index.jsonl append-only, latest wins) then the transcript's first real user message (control wrappers stripped, first non-empty line, 120-char cap — the same derivation `codex resume` uses as its fallback), else the fixed placeholder 'Codex', which GenTerminal filters so a placeholder never clobbers a user-chosen record name.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v python3 >/dev/null 2>&1 && python3 \"$PLUGIN_ROOT/scripts/report.py\" || true",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v python3 >/dev/null 2>&1 && python3 \"$PLUGIN_ROOT/scripts/report.py\" || true",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v python3 >/dev/null 2>&1 && python3 \"$PLUGIN_ROOT/scripts/report.py\" || true",
+            "async": true,
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v python3 >/dev/null 2>&1 && python3 \"$PLUGIN_ROOT/scripts/report.py\" || true",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v python3 >/dev/null 2>&1 && python3 \"$PLUGIN_ROOT/scripts/report.py\" || true",
+            "timeout": 3
+          }
+        ]
+      }
+    ]
+  }
+}

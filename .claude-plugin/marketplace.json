@@ -1,0 +1,14 @@
+{
+  "name": "codex-conversation-archiver",
+  "owner": {
+    "name": "Genspark",
+    "url": "https://genspark.ai"
+  },
+  "plugins": [
+    {
+      "name": "conversation-archiver",
+      "source": "./plugins/conversation-archiver",
+      "description": "Report Codex CLI session status and titles to GenTerminal over OSC 9999 (sidebar Sessions name sync + status)."
+    }
+  ]
+}
