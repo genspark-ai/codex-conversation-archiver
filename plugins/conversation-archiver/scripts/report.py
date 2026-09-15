@@ -47,6 +47,7 @@ import re
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -147,6 +148,15 @@ def _watch_ttyfile(session_id: str) -> Path:
     return _data_dir() / f"{session_id}.tty"
 
 
+def _watch_logfile(session_id: str) -> Path:
+    """One-line-per-life log of the session's watcher daemon: the spawn
+    parameters, then a single exit line naming WHY it stopped. Written by the
+    daemon (title_watch.py); truncated at spawn. Exists because every other
+    failure mode in this file degrades to silence, and a watcher that dies
+    silently is indistinguishable from one that was never spawned."""
+    return _data_dir() / f"{session_id}.watch.log"
+
+
 def _watch_current_file(key: str) -> Path:
     """Which codex session is the CURRENT one for a watch key (one managed
     tmux pane / record).
@@ -160,22 +170,85 @@ def _watch_current_file(key: str) -> Path:
     return _data_dir() / f"current-{key}"
 
 
-def _watch_key() -> str:
-    """Stable per-pane identity for the current-session file.
+def _watch_log_append(session_id: str, message: str) -> None:
+    """Append one timestamped line to the session's watcher log.
 
-    Under tmux the pane's session name is the managed record's `tmux_name` —
-    the join key the app's Sessions section uses — so a /new in the same pane
-    supersedes the previous session's watcher. Empty without tmux: the
-    per-session watcher then lives until codex exits (the pid probe)."""
+    Single writer implementation shared by ensure_watcher / stop_watcher here
+    and the daemon (title_watch.Watch.log) — best-effort, because logging must
+    never itself become a failure."""
+    try:
+        with _watch_logfile(session_id).open("a", encoding="utf-8") as fh:
+            fh.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {message}\n")
+    except OSError:
+        pass
+
+
+def _tmux_identity() -> tuple[str, str]:
+    """`(session name, pane id)` from ONE tmux call, or `("", "")`.
+
+    The session name is the pane's identity for the generation file (the
+    managed record's `tmux_name`, the same join key the app uses); the pane id
+    is the daemon's tmux-side liveness anchor — when the pane is gone (tab
+    closed, session destroyed) the watcher must go too, and that signal works
+    even when no codex pid could be resolved. Deliberately not
+    `notify.tmux_context()`: that value is the notification payload's wire
+    contract, and this only needs two format fields."""
     if not os.environ.get("TMUX"):
+        return ("", "")
+    try:
+        out = subprocess.run(
+            ["tmux", "display-message", "-p", "#{pane_id}\t#S"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return ("", "")
+    pane, _, name = out.partition("\t")
+    return (name.strip(), pane.strip())
+
+
+def _watch_key(session_name: str) -> str:
+    """Stable per-pane identity for the current-session file (empty when not
+    under tmux: the per-session watcher then relies on its process/lifetime
+    bounds alone)."""
+    if not session_name:
+        return ""
+    return "tmux-" + hashlib.sha1(session_name.encode("utf-8")).hexdigest()[:16]
+
+
+def process_start(pid: int) -> str:
+    """The process's start time (`ps -o lstart=`), or "" when unknown.
+
+    The daemon's liveness probe pairs this with the pid so a RECYCLED pid — a
+    dead codex whose number a later process took — cannot keep a watcher alive
+    past its session. "" means "could not tell" (no ps, unsupported flag) and
+    must be read as "still alive", never as "gone": a probe outage must not
+    kill a healthy watcher."""
+    if not pid:
         return ""
     try:
-        name = (notify.tmux_context() or {}).get("session")
-    except Exception:  # noqa: BLE001  (never disrupt the session)
+        return subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+    except (FileNotFoundError, subprocess.SubprocessError):
         return ""
-    if not name:
-        return ""
-    return "tmux-" + hashlib.sha1(name.encode("utf-8")).hexdigest()[:16]
+
+
+def tmux_pane_alive(pane: str) -> bool:
+    """Whether the tmux pane the emitter ran in still exists.
+
+    Unknown (no tmux in the env, or a tmux failure) is True: this is a
+    best-effort extra bound on a detached daemon, never a reason to exit."""
+    if not pane or not os.environ.get("TMUX"):
+        return True
+    try:
+        res = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", pane, "#{pane_id}"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return True
+    return res.returncode == 0 and bool(res.stdout.strip())
 
 
 def is_current_generation(session_id: str) -> bool:
@@ -188,7 +261,7 @@ def is_current_generation(session_id: str) -> bool:
     that no longer exists — the exact stale-name class this file's generation
     tracking exists to prevent. Unknown (non-tmux, or no file yet) is True:
     the previous behaviour, and the only sane default there."""
-    key = _watch_key()
+    key = _watch_key(_tmux_identity()[0])
     if not key:
         return True
     try:
@@ -262,6 +335,33 @@ def _spawn_watcher(argv: list[str]) -> int | None:
     return proc.pid
 
 
+def _pidfile_watcher_alive(session_id: str) -> bool:
+    """Whether the session's pidfile names a LIVE watcher for that session.
+
+    A bare `kill(pid, 0)` is not enough: pids get recycled, and a stale
+    pidfile whose number a later process took would make ensure_watcher skip
+    the spawn forever — leaving the session with no watcher and, because this
+    file degrades to silence, no trace of why. So confirm the process really
+    is a title_watch.py for this session id; an unverifiable probe (no ps, an
+    unsupported flag) trusts the live pid rather than risk a duplicate."""
+    try:
+        pid = int(_watch_pidfile(session_id).read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    try:
+        args = subprocess.run(
+            ["ps", "-ww", "-o", "args=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return True
+    return "title_watch.py" in args and session_id in args
+
+
 def ensure_watcher(session_id: str, codex_home: Path) -> bool:
     """Keep one title_watch.py daemon alive for the session; returns True when
     a new one was spawned.
@@ -269,12 +369,16 @@ def ensure_watcher(session_id: str, codex_home: Path) -> bool:
     /rename fires no hook, so report() below only delivers a manual rename on
     the NEXT hook event — the next prompt, when the session is idle. The
     daemon polls the session index and closes that gap; every hook run
-    re-ensures it (cheap pidfile + kill(0) probe) so a crashed or
+    re-ensures it (cheap pidfile + liveness probe) so a crashed or
     lifetime-expired watcher heals on the session's next activity.
 
-    The target tty travels through _watch_ttyfile, refreshed on EVERY hook run
-    — not just at spawn — because the run that spawns the watcher may be unable
-    to resolve one (early SessionStart) while a later run can."""
+    The daemon is handed everything it needs to stop itself when the session
+    ends, because this hook will not run again to do it: the codex process
+    identity (pid + start time, so a recycled pid cannot fake liveness) and
+    the tmux pane id (so a closed tab stops it even without a pid). The target
+    tty travels through _watch_ttyfile, refreshed on EVERY hook run — not just
+    at spawn — because the run that spawns the watcher may be unable to
+    resolve one (early SessionStart) while a later run can."""
     if os.name != "posix":
         # Liveness probing is kill(0)-based; on Windows that terminates the
         # probed process. The hook cadence remains the only reporter there.
@@ -284,31 +388,31 @@ def ensure_watcher(session_id: str, codex_home: Path) -> bool:
         # behind pointing at a temp dir that is about to be deleted.
         return False
     _refresh_watch_tty(session_id)
-    key = _watch_key()
+    session_name, pane = _tmux_identity()
+    key = _watch_key(session_name)
     if key:
         # Announce the current generation BEFORE spawning: an abandoned
         # thread's watcher (same pane, older session id) exits on its next
         # tick. Written every run so it heals a clobbered/deleted file.
         _atomic_write(_watch_current_file(key), session_id)
-    pidfile = _watch_pidfile(session_id)
+    if _pidfile_watcher_alive(session_id):
+        return False  # a watcher is running
     try:
-        os.kill(int(pidfile.read_text(encoding="utf-8").strip()), 0)
-        return False  # a watcher is alive
-    except (OSError, ValueError):
-        pass  # missing/garbled pidfile or dead pid — spawn a fresh one
-    try:
+        owner = codex_pid()
         argv = [
             sys.executable,
             str(Path(__file__).resolve().parent / "title_watch.py"),
             "--session-id", session_id,
             "--codex-home", str(codex_home),
-            "--codex-pid", str(codex_pid() or 0),
+            "--codex-pid", str(owner or 0),
+            "--codex-start", process_start(owner) if owner else "",
             "--key", key,
+            "--pane", pane,
         ]
         pid = _spawn_watcher(argv)
         if pid is None:
             return False
-        _atomic_write(pidfile, str(pid))
+        _atomic_write(_watch_pidfile(session_id), str(pid))
         return True
     except Exception:  # noqa: BLE001  (never disrupt the session)
         return False
@@ -326,6 +430,7 @@ def stop_watcher(session_id: str) -> None:
         pid = int(pidfile.read_text(encoding="utf-8").strip())
     except (OSError, ValueError):
         return
+    _watch_log_append(session_id, f"stop requested by SessionEnd pid:{pid}")
     try:
         os.kill(pid, signal.SIGTERM)
     except OSError:

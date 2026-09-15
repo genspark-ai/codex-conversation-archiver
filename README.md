@@ -80,13 +80,29 @@ hook-driven reporter can only deliver an idle rename on the NEXT hook event,
 i.e. the next prompt — which is exactly when a human renames.
 
 `report.ensure_watcher()` therefore spawns one detached `title_watch.py` per
-session from the ordinary hook runs (SessionStart / UserPromptSubmit / Stop,
-cheap pidfile + `kill(0)` probe). It polls `session_index.jsonl` every 1.5 s
-and pushes a name change through the same `notify.emit` + `<session>.title`
-marker path the hook reporter uses, so the two never double-report. It exits
-when superseded, when SessionEnd tears it down, when the codex process is
-gone, or at a 7-day lifetime backstop. POSIX only (`kill(0)` liveness); on
-Windows the hook cadence stays the only reporter.
+session from the ordinary hook runs (SessionStart / UserPromptSubmit / Stop).
+It polls `session_index.jsonl` every 1.5 s and pushes a name change through the
+same `notify.emit` + `<session>.title` marker path the hook reporter uses, so
+the two never double-report. POSIX only (`kill(0)` liveness); on Windows the
+hook cadence stays the only reporter.
+
+Because the hook that spawned it will not run again when the session ends, the
+daemon is handed every signal it needs to stop itself, and it exits on the
+first one that fires:
+
+| anchor | exits when | measured |
+|--------|-----------|----------|
+| SessionEnd | codex ends its main thread (`/quit`) → the hook SIGTERMs the daemon | instant |
+| tmux pane | the pane is gone (tab closed, session destroyed) | ~4 s |
+| codex process | pid **+ start time** probe fails 4 polls in a row — the start time is what stops a RECYCLED pid from faking liveness | ~22 s |
+| superseded | another session became current for this pane (`/new`, `/clear`) | ~1.5 s |
+| lifetime | backstop: 7 days with an identified codex process or pane, **1 hour** without either (no liveness signal at all, and any later hook run respawns it) | — |
+
+Every spawn and every exit appends a line to
+`<session>.watch.log` in the plugin data dir (`start pid:… codex_pid:…
+lifetime:…` / `exit reason:…`) — the only way to tell a daemon that died from
+one that never started, since everything else in this plugin degrades to
+silence.
 
 `/clear` and `/new` still cannot be reflected the instant they run: codex
 writes neither a rollout file nor an index entry until the new conversation's

@@ -426,6 +426,8 @@ def test_watcher(root: Path) -> None:
 
     sid = "sess-watch"
     index = home / "session_index.jsonl"
+    real_process_start = report.process_start
+    real_pane_alive = report.tmux_pane_alive
 
     def tick(watch: "title_watch.Watch") -> tuple[str | None, list[dict]]:
         reason = watch.tick()
@@ -491,6 +493,42 @@ def test_watcher(root: Path) -> None:
         check("watcher exits when the codex pid is gone",
               reasons[-1] == "codex-exited", repr(reasons[-1]))
 
+        # The codex process identity is pid + START TIME: a LIVE pid whose
+        # start time differs is a recycled number, not this session's codex —
+        # otherwise a dead codex whose pid got reused would keep the daemon
+        # alive forever.
+        me = os.getpid()
+        mine = report.process_start(me)
+        check("process_start reads a real start time", bool(mine), repr(mine))
+        reused = title_watch.Watch(sid, home, codex_pid=me, codex_start="not-the-same-time")
+        reused_reasons = [
+            reused.tick()
+            for _ in range(title_watch.LIVENESS_EVERY * title_watch.PID_MISS_LIMIT)
+        ]
+        check("watcher exits on a recycled pid (start time mismatch)",
+              reused_reasons[-1] == "codex-exited", repr(reused_reasons[-1]))
+        kept = title_watch.Watch(sid, home, codex_pid=me, codex_start=mine)
+        check("watcher stays alive while pid AND start time match",
+              all(kept.tick() is None for _ in range(8)))
+        unknown = title_watch.Watch(sid, home, codex_pid=me, codex_start="expected")
+        report.process_start = lambda pid: ""  # type: ignore[assignment]
+        try:
+            check("an unreadable start time never kills the watcher",
+                  all(unknown.tick() is None for _ in range(8)))
+        finally:
+            report.process_start = real_process_start  # type: ignore[assignment]
+
+        # Pane anchor: the tab/session being gone stops the daemon even when
+        # no codex pid could be resolved at all.
+        report.tmux_pane_alive = lambda pane: False  # type: ignore[assignment]
+        try:
+            paned = title_watch.Watch(sid, home, pane="%3")
+            pane_reasons = [paned.tick() for _ in range(title_watch.LIVENESS_EVERY)]
+            check("watcher exits when its tmux pane is gone",
+                  pane_reasons[-1] == "pane-gone", repr(pane_reasons))
+        finally:
+            report.tmux_pane_alive = real_pane_alive  # type: ignore[assignment]
+
         # A /new in the same pane announces a new generation: the previous
         # session's watcher must bow out, so a record holds one poller rather
         # than one per abandoned thread.
@@ -509,6 +547,15 @@ def test_watcher(root: Path) -> None:
         check("spawned watcher is alive", title_watch.alive(daemon_pid))
         check("ensure_watcher is idempotent while the daemon lives",
               report.ensure_watcher(sid, home) is False)
+        # Let the daemon actually start before tearing it down: a SIGTERM
+        # delivered before its first bytecode would (correctly) leave no start
+        # line, which is a test race, not a bug.
+        deadline = time.time() + 5
+        while time.time() < deadline and not report._watch_logfile(sid).exists():
+            time.sleep(0.1)
+        if report._watch_logfile(sid).exists():
+            while time.time() < deadline and "start pid:" not in report._watch_logfile(sid).read_text(encoding="utf-8"):
+                time.sleep(0.1)
         report.stop_watcher(sid)
         try:
             os.waitpid(daemon_pid, 0)  # reap our own child
@@ -517,6 +564,25 @@ def test_watcher(root: Path) -> None:
         check("stop_watcher terminates the daemon and drops its pidfile",
               not title_watch.alive(daemon_pid)
               and not report._watch_pidfile(sid).exists())
+        # The log is the only way to tell a watcher that died from one that
+        # never started, so its two lines are load-bearing.
+        log_text = report._watch_logfile(sid).read_text(encoding="utf-8")
+        check("the daemon logs its spawn parameters",
+              f"start pid:{daemon_pid}" in log_text and f"session:{sid}" in log_text,
+              repr(log_text[:200]))
+        check("SessionEnd teardown is logged too",
+              "stop requested by SessionEnd" in log_text, repr(log_text[:200]))
+        # An exit through the daemon's own logic is logged with its reason.
+        # (run() polls, so the pane anchor needs its 4-tick liveness cadence.)
+        report._atomic_write(report._watch_logfile(sid), "")
+        report.tmux_pane_alive = lambda pane: False  # type: ignore[assignment]
+        try:
+            title_watch.run(sid, home, 0, "", "", "%3")
+        finally:
+            report.tmux_pane_alive = real_pane_alive  # type: ignore[assignment]
+        check("a self-terminating watch logs its exit reason",
+              "exit reason:pane-gone" in report._watch_logfile(sid).read_text(encoding="utf-8"),
+              repr(report._watch_logfile(sid).read_text(encoding="utf-8")[:200]))
 
         # report() must keep the watcher alive across the turn hooks and tear
         # it down on SessionEnd (an abandoned thread leaves no lingering poll).
@@ -547,7 +613,7 @@ def test_watcher(root: Path) -> None:
         # the session that IS current for the pane. (_watch_key is stubbed:
         # the selftest has no tmux to hash a session name from.)
         real_key, real_stop = report._watch_key, report.stop_watcher
-        report._watch_key = lambda: "tmux-test"  # type: ignore[assignment]
+        report._watch_key = lambda session_name: "tmux-test"  # type: ignore[assignment]
         report.stop_watcher = lambda session_id: None  # type: ignore[assignment]
         try:
             report._atomic_write(report._watch_current_file("tmux-test"), "current-1")
