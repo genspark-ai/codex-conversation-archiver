@@ -250,7 +250,9 @@ def run(
         f"lifetime:{lifetime}s"
     )
     deadline = time.monotonic() + lifetime
-    reason = "lifetime"
+    # Only a tick/signal reason lands here; a loop that runs out the deadline
+    # must log "lifetime", not the last (None) keep-running tick result.
+    reason: str | None = None
     try:
         while time.monotonic() < deadline:
             reason = watch.tick()
@@ -260,7 +262,7 @@ def run(
     except Exception as exc:  # noqa: BLE001  (never die without a trace)
         reason = f"exception:{exc!r}"
     finally:
-        watch.log(f"exit reason:{reason}")
+        watch.log(f"exit reason:{reason or 'lifetime'}")
         # Best-effort: drop the pidfile only if it is still ours, so a
         # successor's file is never removed.
         try:

@@ -1,6 +1,6 @@
 {
   "name": "conversation-archiver",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Report Codex CLI session status and titles to GenTerminal over OSC 9999: sidebar Sessions name sync, started/turn/complete status, unread-dot activity.",
   "hooks": "./hooks/hooks.json"
 }

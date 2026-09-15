@@ -583,6 +583,18 @@ def test_watcher(root: Path) -> None:
         check("a self-terminating watch logs its exit reason",
               "exit reason:pane-gone" in report._watch_logfile(sid).read_text(encoding="utf-8"),
               repr(report._watch_logfile(sid).read_text(encoding="utf-8")[:200]))
+        # Running out the lifetime is a distinct reason from a tick's — the
+        # loop must not log the last keep-running (None) tick result.
+        report._atomic_write(report._watch_logfile(sid), "")
+        real_lifetime = title_watch.UNVERIFIED_LIFETIME_SECONDS
+        title_watch.UNVERIFIED_LIFETIME_SECONDS = 0  # type: ignore[assignment]
+        try:
+            title_watch.run(sid, home, 0, "", "", "")  # no anchors = unverified
+        finally:
+            title_watch.UNVERIFIED_LIFETIME_SECONDS = real_lifetime
+        check("lifetime expiry logs 'lifetime', not the last tick result",
+              "exit reason:lifetime" in report._watch_logfile(sid).read_text(encoding="utf-8"),
+              repr(report._watch_logfile(sid).read_text(encoding="utf-8")[:200]))
 
         # report() must keep the watcher alive across the turn hooks and tear
         # it down on SessionEnd (an abandoned thread leaves no lingering poll).
