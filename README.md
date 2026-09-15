@@ -17,7 +17,6 @@ this tree is the origin copy; keep the two in sync when touching the plugin:
 plugins/conversation-archiver/.codex-plugin/plugin.json
 plugins/conversation-archiver/hooks/hooks.json         lifecycle hooks (SessionStart / UserPromptSubmit / PostToolUse / Stop / SessionEnd)
 plugins/conversation-archiver/scripts/report.py        status + title reporting (hook-driven)
-plugins/conversation-archiver/scripts/title_watch.py   detached per-session title watcher (the /rename immediacy fix)
 plugins/conversation-archiver/scripts/notify.py        OSC 9999 emitter + tmux context (wire contract of GenTerminal's utils/osc.ts)
 plugins/conversation-archiver/tests/selftest.py       stdlib-only selftest (also run from CI via the Jest wrapper in the terminal repo)
 ```
@@ -36,7 +35,6 @@ sourceId:<session id>, event:"TitleChanged", title, body, tmux}`:
 | PostToolUse     | only on a title change                | a mid-turn Rename chat or the first derived title; plain tool activity never emits (no inbox spam) |
 | Stop            | `Turn complete · N turns`             | |
 | SessionEnd      | `Session ended`                       | suppressed for an abandoned thread (`/new`, `/clear`) — it would carry the dead conversation's stale title |
-| title_watch daemon | `Session renamed`                  | an IDLE Rename chat, within ~1.5 s of the write; see below |
 
 ## Title resolution (same order as `codex resume`)
 
@@ -68,47 +66,44 @@ sorting when the tab is in the background.
 - **stdlib-only Python 3** — no dependencies to install.
 - **tmux-aware**: the sequence rides tmux's DCS passthrough, so it works in
   the panes GenTerminal manages (that is the primary deployment).
-- Opt out with `CODEX_ARCHIVER_NO_NOTIFY=1`; opt out of the watcher daemon
-  alone with `CODEX_ARCHIVER_NO_WATCHER=1`.
+- Opt out with `CODEX_ARCHIVER_NO_NOTIFY=1`.
 
-## The `/rename` watcher (why a daemon exists)
+## When a rename reaches GenTerminal
 
-`/rename` (and `/clear` / `/new`) fire NO hook — verified against codex-rs
-(`HookEventName` has no rename variant) and live against codex-cli 0.154.0
-(`session_index.jsonl` gains the new name with zero hook invocations). So the
-hook-driven reporter can only deliver an idle rename on the NEXT hook event,
-i.e. the next prompt — which is exactly when a human renames.
+`/rename` — and `/clear` and `/new` — fire NO hook. Verified against codex-rs
+(`HookEventName` has no rename variant) and live against codex-cli 0.154.0,
+where `session_index.jsonl` gains the new name with zero hook invocations, and
+`/new` produces no rollout file or index entry until the new conversation's
+first turn.
 
-`report.ensure_watcher()` therefore spawns one detached `title_watch.py` per
-session from the ordinary hook runs (SessionStart / UserPromptSubmit / Stop).
-It polls `session_index.jsonl` every 1.5 s and pushes a name change through the
-same `notify.emit` + `<session>.title` marker path the hook reporter uses, so
-the two never double-report. POSIX only (`kill(0)` liveness); on Windows the
-hook cadence stays the only reporter.
+Titles resolve custom-first (`custom_thread_name`), so a rename lands on the
+session's NEXT hook event:
 
-Because the hook that spawned it will not run again when the session ends, the
-daemon is handed every signal it needs to stop itself, and it exits on the
-first one that fires:
+| what you did | delivered by | when |
+|---|---|---|
+| renamed, then sent a prompt | `UserPromptSubmit` (after `SessionStart`) | at that prompt |
+| renamed while a turn was running | `Stop` | at the end of that turn |
+| renamed, then quit codex | `SessionEnd` | at exit |
+| renamed an idle session and left it untouched | — | next time the session does anything |
 
-| anchor | exits when | measured |
-|--------|-----------|----------|
-| SessionEnd | codex ends its main thread (`/quit`) → the hook SIGTERMs the daemon | instant |
-| tmux pane | the pane is gone (tab closed, session destroyed) | ~4 s |
-| codex process | pid **+ start time** probe fails 4 polls in a row — the start time is what stops a RECYCLED pid from faking liveness | ~22 s |
-| superseded | another session became current for this pane (`/new`, `/clear`) | ~1.5 s |
-| lifetime | backstop: 7 days with an identified codex process or pane, **1 hour** without either (no liveness signal at all, and any later hook run respawns it) | — |
+0.2.0–0.2.2 closed the last row with a detached polling daemon
+(`title_watch.py`). 0.3.0 removed it: the case that needs it most — a rename
+in a conversation that has not had a turn yet — writes an index entry carrying
+only `{id, thread_name, updated_at}`, with no rollout file, no cwd and no pane,
+so nothing can attribute that name to a managed record, while a daemon per
+pane still cost a process, per-hook `tmux` round trips and a pile of state.
+The accepted behaviour is the table above.
 
-Every spawn and every exit appends a line to
-`<session>.watch.log` in the plugin data dir (`start pid:… codex_pid:…
-lifetime:…` / `exit reason:…`) — the only way to tell a daemon that died from
-one that never started, since everything else in this plugin degrades to
-silence.
+## Abandoned threads (`/new`, `/clear`)
 
-`/clear` and `/new` still cannot be reflected the instant they run: codex
-writes neither a rollout file nor an index entry until the new conversation's
-first turn, so there is no signal to watch. Both update the record at that
-first turn (the new prompt's title), and the previous thread's later
-SessionEnd is suppressed so it cannot rename the record back.
+Codex keeps firing the abandoned thread's hooks after `/new` or `/clear` —
+its `SessionEnd` for certain, at `/quit` or when the TUI finalizes it. That
+payload carries the SAME tmux context as the live session and resolves to the
+dead conversation's own title, so emitting it would rename the managed record
+back to a conversation that no longer exists. Each turn records its session id
+in `current-<pane key>` (the tmux session name hashed), and a `SessionEnd`
+whose id is not the current one is dropped. With no tmux, or nothing recorded
+yet, the guard is inert — the behaviour that preceded it.
 
 ## Hook trust
 
@@ -125,9 +120,9 @@ marketplace.
 python3 plugins/conversation-archiver/tests/selftest.py
 ```
 
-Covers title resolution, event semantics/turn counting, the watcher daemon
-(index-name report, de-duplication with the hook reporter, supersede /
-generation / liveness exits, spawn-stop lifecycle), the OSC 9999 wire contract
-captured from a real pty (the detached-hook shape), and hostile inputs. The
+Covers title resolution, event semantics/turn counting, the generation guard
+(an abandoned thread's SessionEnd must not rename, and must be inert without
+tmux), the OSC 9999 wire contract captured from a real pty (the detached-hook
+shape), and hostile inputs. The
 terminal repo runs the same selftest from Jest
 (`__tests__/codexArchiverPlugin.test.ts`).

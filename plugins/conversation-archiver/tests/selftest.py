@@ -13,11 +13,9 @@ Layers:
      tolerated), derived title (control wrappers stripped, environment blocks
      skipped, first non-empty line, 120-char cap), placeholder fallback.
   2. Event semantics — bodies per event, turn counting, clear reset,
-     PostToolUse only-on-change, SessionEnd, no-notify env opt-out, and the
-     watcher keep-alive/teardown wiring on the turn hooks.
-  3. Title watcher daemon (title_watch.py) — the /rename immediacy path: the
-     index-name report, fingerprint short-circuit, marker de-duplication with
-     the hook reporter, supersede/liveness exits, and the spawn/stop lifecycle.
+     PostToolUse only-on-change, SessionEnd, no-notify env opt-out.
+  3. Session generation guard — an abandoned thread's SessionEnd (`/new`,
+     `/clear`) must not rename the record, and must be inert without tmux.
   4. End-to-end emission — report.py as a subprocess with a real pty as its
      controlling tty (setsid + TIOCSCTTY, the same detached shape a codex
      hook has), capturing the raw OSC 9999 bytes from the pty master and
@@ -295,12 +293,6 @@ def test_events(root: Path) -> None:
     os.environ["PLUGIN_DATA"] = str(data)
     os.environ.pop("TMUX", None)
     os.environ.pop("CODEX_ARCHIVER_NO_NOTIFY", None)
-    # These are report()-semantics tests: stub the watcher daemon out so the
-    # in-process runs do not spawn real pollers (test_watcher covers that
-    # lifecycle, and its wiring check pins the calls these events make).
-    real_ensure, real_stop = report.ensure_watcher, report.stop_watcher
-    report.ensure_watcher = lambda session_id, codex_home: False  # type: ignore[assignment]
-    report.stop_watcher = lambda session_id: None  # type: ignore[assignment]
 
     sid = "sess-ev"
 
@@ -405,249 +397,70 @@ def test_events(root: Path) -> None:
     os.environ.pop("CODEX_ARCHIVER_NO_NOTIFY", None)
 
     fake.restore()
-    report.ensure_watcher, report.stop_watcher = real_ensure, real_stop
 
 
-# ── 3. title watcher daemon (the /rename immediacy path) ───────────────────
+# ── 3. session generation guard (abandoned threads must not rename) ────────
 
-def test_watcher(root: Path) -> None:
-    import title_watch  # noqa: PLC0415  (sibling of report/notify)
-
-    w_root = root / "watch"
-    w_root.mkdir()
-    home, _ = make_home(w_root, "sess-watch")
-    data = w_root / "plugindata" / "state"
+def test_generation_guard(root: Path) -> None:
+    """`/new` and `/clear` abandon a thread, yet codex still fires that
+    thread's SessionEnd later — carrying the same tmux context and resolving
+    to the DEAD conversation's title. Each turn records its session id per
+    pane, and a non-current generation's SessionEnd is dropped."""
+    g_root = root / "generation"
+    g_root.mkdir()
+    home, rollout = make_home(g_root, "sess-gen")
+    data = g_root / "plugindata" / "state"
     data.mkdir(parents=True)
-    fake = FakeTty(w_root)
+    fake = FakeTty(g_root)
     os.environ["CODEX_HOME"] = str(home)
     os.environ["PLUGIN_DATA"] = str(data)
     os.environ.pop("TMUX", None)
     os.environ.pop("CODEX_ARCHIVER_NO_NOTIFY", None)
 
-    sid = "sess-watch"
-    index = home / "session_index.jsonl"
-    real_process_start = report.process_start
-    real_pane_alive = report.tmux_pane_alive
-
-    def tick(watch: "title_watch.Watch") -> tuple[str | None, list[dict]]:
-        reason = watch.tick()
-        events = decode_osc(fake.read_all())
+    def emit_once(session_id: str, event: str, **extra: object) -> list[dict]:
         fake.file.write_text("")
-        return reason, events
+        report.report(payload_for(session_id, str(rollout), event, **extra))
+        return decode_osc(fake.read_all())
 
+    # No tmux (the selftest has none): the guard is inert, the pre-guard
+    # behaviour, and inert must mean "allow", never "block".
+    check("without a tmux pane the guard is inert",
+          report.is_current_generation("anything") is True)
+
+    real_name = report._tmux_session_name
+    report._tmux_session_name = lambda: "gt-gen"  # type: ignore[assignment]
     try:
-        # Fresh state (no marker): the index already names the thread, so the
-        # daemon reports it — the hook run that spawned it may have had no tty.
-        watch = title_watch.Watch(sid, home)
-        reason, events = tick(watch)
-        check("watcher reports the current index name on its first tick",
-              reason is None and bool(events) and events[0]["title"] == "My renamed chat",
-              json.dumps(events[:1])[:200])
-        check("watcher notification contract",
-              bool(events) and events[0]["source"] == report.SOURCE
-              and events[0]["event"] == "TitleChanged"
-              and events[0]["body"] == title_watch.BODY
-              and events[0]["sourceId"] == sid
-              and events[0]["magic"] == notify.MAGIC,
-              json.dumps(events[:1])[:200])
-        check("watcher marks the title as reported",
-              report._read_text(report._title_file(sid)) == "My renamed chat")
+        key = report._generation_key("gt-gen")
+        check("nothing recorded yet: the guard is inert",
+              report.is_current_generation("sess-1") is True)
 
-        # Unchanged index: the stat fingerprint short-circuits — nothing emits.
-        reason, events = tick(watch)
-        check("watcher stays silent when the index did not move",
-              reason is None and not events, repr(events))
+        report.mark_current_generation("sess-1")
+        check("the marking session is current",
+              report.is_current_generation("sess-1") is True)
+        check("anything else is not current",
+              report.is_current_generation("sess-0") is False)
 
-        # A /rename appends a new latest entry for the thread id → deliver it.
-        with index.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(
-                {"id": sid, "thread_name": "Renamed while idle", "updated_at": "t9"}
-            ) + "\n")
-        reason, events = tick(watch)
-        check("watcher delivers an idle rename",
-              bool(events) and events[0]["title"] == "Renamed while idle",
-              json.dumps(events[:1])[:200])
+        # A turn marks the generation through report() itself.
+        report._atomic_write(report._current_session_file(key), "old")
+        report.report(payload_for("sess-new", str(rollout), "UserPromptSubmit", prompt="hi"))
+        check("a turn records its session as the pane's current one",
+              report.is_current_generation("sess-new") is True
+              and report.is_current_generation("old") is False)
 
-        # Another session's rename moves the fingerprint but not OUR latest
-        # name: the shared marker keeps the two reporters from double-emitting.
-        with index.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(
-                {"id": "elsewhere", "thread_name": "other chat", "updated_at": "t10"}
-            ) + "\n")
-        reason, events = tick(watch)
-        check("watcher does not re-emit an unchanged title", not events, repr(events))
+        # The dead thread's SessionEnd must stay silent; the live one must not.
+        check("an abandoned thread's SessionEnd emits nothing",
+              not emit_once("old", "SessionEnd", reason="other"))
+        check("the current session's SessionEnd still emits",
+              bool(emit_once("sess-new", "SessionEnd", reason="other")))
 
-        # Supersede: the pidfile naming a different process makes us bow out.
-        report._watch_pidfile(sid).write_text(str(os.getpid() + 1), encoding="utf-8")
-        reason, _ = tick(watch)
-        check("watcher bows out when superseded", reason == "superseded", repr(reason))
-
-        # codex gone: PID_MISS_LIMIT consecutive liveness misses exit the
-        # daemon (an impossible pid probes as dead on every platform).
-        report._watch_pidfile(sid).write_text(str(os.getpid()), encoding="utf-8")
-        dying = title_watch.Watch(sid, home, codex_pid=2**31 - 1)
-        reasons = [
-            dying.tick()
-            for _ in range(title_watch.LIVENESS_EVERY * title_watch.PID_MISS_LIMIT)
-        ]
-        check("watcher exits when the codex pid is gone",
-              reasons[-1] == "codex-exited", repr(reasons[-1]))
-
-        # The codex process identity is pid + START TIME: a LIVE pid whose
-        # start time differs is a recycled number, not this session's codex —
-        # otherwise a dead codex whose pid got reused would keep the daemon
-        # alive forever.
-        me = os.getpid()
-        mine = report.process_start(me)
-        check("process_start reads a real start time", bool(mine), repr(mine))
-        reused = title_watch.Watch(sid, home, codex_pid=me, codex_start="not-the-same-time")
-        reused_reasons = [
-            reused.tick()
-            for _ in range(title_watch.LIVENESS_EVERY * title_watch.PID_MISS_LIMIT)
-        ]
-        check("watcher exits on a recycled pid (start time mismatch)",
-              reused_reasons[-1] == "codex-exited", repr(reused_reasons[-1]))
-        kept = title_watch.Watch(sid, home, codex_pid=me, codex_start=mine)
-        check("watcher stays alive while pid AND start time match",
-              all(kept.tick() is None for _ in range(8)))
-        unknown = title_watch.Watch(sid, home, codex_pid=me, codex_start="expected")
-        report.process_start = lambda pid: ""  # type: ignore[assignment]
-        try:
-            check("an unreadable start time never kills the watcher",
-                  all(unknown.tick() is None for _ in range(8)))
-        finally:
-            report.process_start = real_process_start  # type: ignore[assignment]
-
-        # Pane anchor: the tab/session being gone stops the daemon even when
-        # no codex pid could be resolved at all.
-        report.tmux_pane_alive = lambda pane: False  # type: ignore[assignment]
-        try:
-            paned = title_watch.Watch(sid, home, pane="%3")
-            pane_reasons = [paned.tick() for _ in range(title_watch.LIVENESS_EVERY)]
-            check("watcher exits when its tmux pane is gone",
-                  pane_reasons[-1] == "pane-gone", repr(pane_reasons))
-        finally:
-            report.tmux_pane_alive = real_pane_alive  # type: ignore[assignment]
-
-        # A /new in the same pane announces a new generation: the previous
-        # session's watcher must bow out, so a record holds one poller rather
-        # than one per abandoned thread.
-        report._atomic_write(report._watch_current_file("tmux-test"), sid)
-        gen = title_watch.Watch(sid, home, key="tmux-test")
-        check("watcher stays current for its own generation", gen.tick() is None)
-        report._atomic_write(report._watch_current_file("tmux-test"), "newer-session")
-        check("watcher bows out when another session becomes current",
-              gen.tick() == "superseded-generation")
-
-        # Spawn/stop lifecycle: one daemon per session, idempotent while it
-        # lives, terminated (and its pidfile dropped) on SessionEnd.
-        report._watch_pidfile(sid).unlink(missing_ok=True)
-        check("ensure_watcher spawns a daemon", report.ensure_watcher(sid, home) is True)
-        daemon_pid = int(report._watch_pidfile(sid).read_text(encoding="utf-8").strip())
-        check("spawned watcher is alive", title_watch.alive(daemon_pid))
-        check("ensure_watcher is idempotent while the daemon lives",
-              report.ensure_watcher(sid, home) is False)
-        # Let the daemon actually start before tearing it down: a SIGTERM
-        # delivered before its first bytecode would (correctly) leave no start
-        # line, which is a test race, not a bug.
-        deadline = time.time() + 5
-        while time.time() < deadline and not report._watch_logfile(sid).exists():
-            time.sleep(0.1)
-        if report._watch_logfile(sid).exists():
-            while time.time() < deadline and "start pid:" not in report._watch_logfile(sid).read_text(encoding="utf-8"):
-                time.sleep(0.1)
-        report.stop_watcher(sid)
-        try:
-            os.waitpid(daemon_pid, 0)  # reap our own child
-        except OSError:
-            pass
-        check("stop_watcher terminates the daemon and drops its pidfile",
-              not title_watch.alive(daemon_pid)
-              and not report._watch_pidfile(sid).exists())
-        # The log is the only way to tell a watcher that died from one that
-        # never started, so its two lines are load-bearing.
-        log_text = report._watch_logfile(sid).read_text(encoding="utf-8")
-        check("the daemon logs its spawn parameters",
-              f"start pid:{daemon_pid}" in log_text and f"session:{sid}" in log_text,
-              repr(log_text[:200]))
-        check("SessionEnd teardown is logged too",
-              "stop requested by SessionEnd" in log_text, repr(log_text[:200]))
-        # An exit through the daemon's own logic is logged with its reason.
-        # (run() polls, so the pane anchor needs its 4-tick liveness cadence.)
-        report._atomic_write(report._watch_logfile(sid), "")
-        report.tmux_pane_alive = lambda pane: False  # type: ignore[assignment]
-        try:
-            title_watch.run(sid, home, 0, "", "", "%3")
-        finally:
-            report.tmux_pane_alive = real_pane_alive  # type: ignore[assignment]
-        check("a self-terminating watch logs its exit reason",
-              "exit reason:pane-gone" in report._watch_logfile(sid).read_text(encoding="utf-8"),
-              repr(report._watch_logfile(sid).read_text(encoding="utf-8")[:200]))
-        # Running out the lifetime is a distinct reason from a tick's — the
-        # loop must not log the last keep-running (None) tick result.
-        report._atomic_write(report._watch_logfile(sid), "")
-        real_lifetime = title_watch.UNVERIFIED_LIFETIME_SECONDS
-        title_watch.UNVERIFIED_LIFETIME_SECONDS = 0  # type: ignore[assignment]
-        try:
-            title_watch.run(sid, home, 0, "", "", "")  # no anchors = unverified
-        finally:
-            title_watch.UNVERIFIED_LIFETIME_SECONDS = real_lifetime
-        check("lifetime expiry logs 'lifetime', not the last tick result",
-              "exit reason:lifetime" in report._watch_logfile(sid).read_text(encoding="utf-8"),
-              repr(report._watch_logfile(sid).read_text(encoding="utf-8")[:200]))
-
-        # report() must keep the watcher alive across the turn hooks and tear
-        # it down on SessionEnd (an abandoned thread leaves no lingering poll).
-        calls: list[tuple[str, str]] = []
-        real_ensure, real_stop = report.ensure_watcher, report.stop_watcher
-        report.ensure_watcher = (  # type: ignore[assignment]
-            lambda session_id, codex_home: (calls.append(("ensure", session_id)), True)[1]
-        )
-        report.stop_watcher = (  # type: ignore[assignment]
-            lambda session_id: calls.append(("stop", session_id))
-        )
-        try:
-            report.report(payload_for("wire-1", str(index), "SessionStart", source="startup"))
-            report.report(payload_for("wire-1", str(index), "UserPromptSubmit", prompt="hi"))
-            report.report(payload_for("wire-1", str(index), "Stop"))
-            report.report(payload_for("wire-1", str(index), "SessionEnd", reason="other"))
-        finally:
-            report.ensure_watcher = real_ensure  # type: ignore[assignment]
-            report.stop_watcher = real_stop  # type: ignore[assignment]
-        check("report() keeps the watcher alive on the turn hooks",
-              ("ensure", "wire-1") in calls, repr(calls))
-        check("report() tears the watcher down on SessionEnd",
-              calls[-1] == ("stop", "wire-1"), repr(calls))
-
-        # SessionEnd generation guard: an abandoned thread (/new, /clear)
-        # shares this pane's tmux context, so its own dead title would rename
-        # the record — report() must stay silent for it while still honouring
-        # the session that IS current for the pane. (_watch_key is stubbed:
-        # the selftest has no tmux to hash a session name from.)
-        real_key, real_stop = report._watch_key, report.stop_watcher
-        report._watch_key = lambda session_name: "tmux-test"  # type: ignore[assignment]
-        report.stop_watcher = lambda session_id: None  # type: ignore[assignment]
-        try:
-            report._atomic_write(report._watch_current_file("tmux-test"), "current-1")
-            check("SessionEnd honours the current generation",
-                  report.is_current_generation("current-1") is True)
-            check("SessionEnd is suppressed for an abandoned generation",
-                  report.is_current_generation("abandoned-0") is False)
-
-            fake.file.write_text("")
-            report.report(payload_for("abandoned-0", str(index), "SessionEnd", reason="other"))
-            check("abandoned thread's SessionEnd emits nothing",
-                  not decode_osc(fake.read_all()))
-            fake.file.write_text("")
-            report.report(payload_for("current-1", str(index), "SessionEnd", reason="other"))
-            check("current session's SessionEnd still emits",
-                  bool(decode_osc(fake.read_all())))
-        finally:
-            report._watch_key = real_key  # type: ignore[assignment]
-            report.stop_watcher = real_stop  # type: ignore[assignment]
-        check("without a tmux key the generation guard is inert",
-              report.is_current_generation("whatever") is True)
+        # SessionEnd must never MARK, or a stale thread could make itself
+        # current and rename the record on its way out.
+        report.report(payload_for("stale", str(rollout), "SessionEnd", reason="other"))
+        check("SessionEnd never marks a generation",
+              report.is_current_generation("sess-new") is True
+              and report.is_current_generation("stale") is False)
     finally:
+        report._tmux_session_name = real_name  # type: ignore[assignment]
         fake.restore()
 
 
@@ -671,10 +484,6 @@ def test_pty_e2e(root: Path) -> None:
     )
     env.pop("TMUX", None)
     env.pop("CODEX_ARCHIVER_NO_NOTIFY", None)
-    # This layer tests report.py's emission, not the daemon (test_watcher
-    # covers that lifecycle); without the opt-out the spawned watcher would
-    # outlive the test pointing at a temp dir that is about to be deleted.
-    env["CODEX_ARCHIVER_NO_WATCHER"] = "1"
     payload = json.dumps(
         payload_for("sess-e2e", rollout, "UserPromptSubmit", prompt="via pty")
     ).encode()
@@ -753,7 +562,7 @@ def main() -> int:
         root = Path(tmp)
         test_title_resolution(root)
         test_events(root)
-        test_watcher(root)
+        test_generation_guard(root)
         test_pty_e2e(root)
     if FAILURES:
         print(f"\n{len(FAILURES)} failure(s):")
