@@ -24,11 +24,15 @@ Title resolution (mirrors what `codex resume` displays, in the same order):
   3. the fixed placeholder "Codex" — GenTerminal never renames a record to a
      placeholder, so a fresh session cannot clobber the user's chosen name.
 
-Codex fires NO hook on Rename chat, so an idle rename reaches consumers on
-the next hook event (next prompt / next turn boundary) rather than within
-seconds. Accepted v1 gap; the cc-conversation-archiver watcher daemon that
-closes it for Claude Code needs a codex process-liveness signal the hook
-payload does not carry.
+Codex fires NO hook on Rename chat (or on /clear and /new), so an idle rename
+reaches consumers on the next hook event (next prompt / next turn boundary)
+rather than within seconds. `ensure_watcher` below closes that gap with the
+same detached per-session daemon the cc-conversation-archiver uses for Claude
+Code (`title_watch.py`): every hook run keeps one alive, it polls
+`$CODEX_HOME/session_index.jsonl` and pushes a name change through this
+module's notify.emit / title-marker path. The codex liveness signal the hook
+payload lacks is resolved here instead — the codex CLI pid is the first
+`codex` ancestor of this hook process.
 
 Never blocks the agent: prints NOTHING on stdout (hook stdout becomes model
 context on several events), always exits 0, every failure degrades to
@@ -36,9 +40,12 @@ silence. Best-effort by design.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import signal
+import subprocess
 import sys
 from pathlib import Path
 
@@ -115,6 +122,216 @@ def _atomic_write(path: Path, text: str) -> None:
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(text, encoding="utf-8")
         tmp.replace(path)
+    except OSError:
+        pass
+
+
+# ── title watcher (`/rename` immediacy) ────────────────────────────────────
+
+def _watch_pidfile(session_id: str) -> Path:
+    """Pidfile of the session's title watcher daemon (title_watch.py). Written
+    ONLY by ensure_watcher below; the daemon reads it and exits when a newer
+    watcher's pid replaces its own (spawn races converge to newest-wins)."""
+    return _data_dir() / f"{session_id}.watch"
+
+
+def _watch_ttyfile(session_id: str) -> Path:
+    """Freshest resolvable target tty for the session's watcher daemon.
+
+    The daemon cannot resolve a tty outside tmux (start_new_session: no
+    controlling terminal, reparented so no useful ancestor chain), and
+    resolution CAN fail in the hook that happens to spawn the watcher (an
+    early SessionStart). So the tty is decoupled from spawn time: EVERY hook
+    run refreshes this file when it can resolve a tty, and the daemon re-reads
+    it before each emit."""
+    return _data_dir() / f"{session_id}.tty"
+
+
+def _watch_current_file(key: str) -> Path:
+    """Which codex session is the CURRENT one for a watch key (one managed
+    tmux pane / record).
+
+    /new and /clear start a NEW codex session id in the SAME pane, and nothing
+    tells the previous session's watcher to stop (codex fires SessionEnd for
+    the abandoned thread only much later, if at all). This file — rewritten by
+    ensure_watcher on every hook run — is that signal: the daemon exits as
+    soon as it names a different session, so one pane holds at most one
+    watcher instead of one per abandoned thread."""
+    return _data_dir() / f"current-{key}"
+
+
+def _watch_key() -> str:
+    """Stable per-pane identity for the current-session file.
+
+    Under tmux the pane's session name is the managed record's `tmux_name` —
+    the join key the app's Sessions section uses — so a /new in the same pane
+    supersedes the previous session's watcher. Empty without tmux: the
+    per-session watcher then lives until codex exits (the pid probe)."""
+    if not os.environ.get("TMUX"):
+        return ""
+    try:
+        name = (notify.tmux_context() or {}).get("session")
+    except Exception:  # noqa: BLE001  (never disrupt the session)
+        return ""
+    if not name:
+        return ""
+    return "tmux-" + hashlib.sha1(name.encode("utf-8")).hexdigest()[:16]
+
+
+def is_current_generation(session_id: str) -> bool:
+    """Whether `session_id` is the CURRENT codex session for this pane.
+
+    A `/new` or `/clear` abandons the previous thread but codex still fires
+    that thread's SessionEnd (at /quit, or when the TUI finalizes it). The
+    abandoned session's hook payload carries the SAME tmux context, so without
+    this guard its "Session ended" would rename the record to a conversation
+    that no longer exists — the exact stale-name class this file's generation
+    tracking exists to prevent. Unknown (non-tmux, or no file yet) is True:
+    the previous behaviour, and the only sane default there."""
+    key = _watch_key()
+    if not key:
+        return True
+    try:
+        current = _watch_current_file(key).read_text(encoding="utf-8").strip()
+    except OSError:
+        return True
+    return not current or current == session_id
+
+
+def _refresh_watch_tty(session_id: str) -> None:
+    """Best-effort: record the currently-resolvable target tty for the
+    daemon. A failure (no tty this run, unwritable state dir) leaves the
+    previous value in place — never raise into the hook."""
+    try:
+        tty = notify._target_tty()
+        if not tty:
+            return
+        tty_file = _watch_ttyfile(session_id)
+        try:
+            if tty_file.read_text(encoding="utf-8").strip() == tty:
+                return
+        except OSError:
+            pass
+        _atomic_write(tty_file, tty)
+    except Exception:  # noqa: BLE001  (never disrupt the session)
+        pass
+
+
+def codex_pid() -> int | None:
+    """Pid of the codex CLI process this hook runs under, or None.
+
+    The hook is a descendant of codex (codex -> sh -c -> python3), so walk the
+    ancestor chain and return the first process whose executable name is
+    codex. Used only as the watcher daemon's liveness probe; None just means
+    the watcher falls back to its lifetime backstop."""
+    pid = os.getppid()
+    for _ in range(8):
+        if pid <= 1:
+            return None
+        try:
+            comm = subprocess.run(
+                ["ps", "-o", "comm=", "-p", str(pid)],
+                capture_output=True, text=True, timeout=5,
+            ).stdout.strip()
+        except (FileNotFoundError, subprocess.SubprocessError):
+            return None
+        if comm and Path(comm).name.startswith("codex"):
+            return pid
+        try:
+            ppid = subprocess.run(
+                ["ps", "-o", "ppid=", "-p", str(pid)],
+                capture_output=True, text=True, timeout=5,
+            ).stdout.strip()
+            pid = int(ppid or "1")
+        except (FileNotFoundError, subprocess.SubprocessError, ValueError):
+            return None
+    return None
+
+
+def _spawn_watcher(argv: list[str]) -> int | None:
+    """Start the watcher fully detached (own session, no inherited stdio) and
+    return its pid. Split out so tests can stub the process launch."""
+    proc = subprocess.Popen(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+    return proc.pid
+
+
+def ensure_watcher(session_id: str, codex_home: Path) -> bool:
+    """Keep one title_watch.py daemon alive for the session; returns True when
+    a new one was spawned.
+
+    /rename fires no hook, so report() below only delivers a manual rename on
+    the NEXT hook event — the next prompt, when the session is idle. The
+    daemon polls the session index and closes that gap; every hook run
+    re-ensures it (cheap pidfile + kill(0) probe) so a crashed or
+    lifetime-expired watcher heals on the session's next activity.
+
+    The target tty travels through _watch_ttyfile, refreshed on EVERY hook run
+    — not just at spawn — because the run that spawns the watcher may be unable
+    to resolve one (early SessionStart) while a later run can."""
+    if os.name != "posix":
+        # Liveness probing is kill(0)-based; on Windows that terminates the
+        # probed process. The hook cadence remains the only reporter there.
+        return False
+    if os.environ.get("CODEX_ARCHIVER_NO_WATCHER"):
+        # Test/automation opt-out: without it an e2e run leaves a poller
+        # behind pointing at a temp dir that is about to be deleted.
+        return False
+    _refresh_watch_tty(session_id)
+    key = _watch_key()
+    if key:
+        # Announce the current generation BEFORE spawning: an abandoned
+        # thread's watcher (same pane, older session id) exits on its next
+        # tick. Written every run so it heals a clobbered/deleted file.
+        _atomic_write(_watch_current_file(key), session_id)
+    pidfile = _watch_pidfile(session_id)
+    try:
+        os.kill(int(pidfile.read_text(encoding="utf-8").strip()), 0)
+        return False  # a watcher is alive
+    except (OSError, ValueError):
+        pass  # missing/garbled pidfile or dead pid — spawn a fresh one
+    try:
+        argv = [
+            sys.executable,
+            str(Path(__file__).resolve().parent / "title_watch.py"),
+            "--session-id", session_id,
+            "--codex-home", str(codex_home),
+            "--codex-pid", str(codex_pid() or 0),
+            "--key", key,
+        ]
+        pid = _spawn_watcher(argv)
+        if pid is None:
+            return False
+        _atomic_write(pidfile, str(pid))
+        return True
+    except Exception:  # noqa: BLE001  (never disrupt the session)
+        return False
+
+
+def stop_watcher(session_id: str) -> None:
+    """Kill the session's watcher daemon and drop its pidfile (SessionEnd).
+
+    Without this an abandoned thread's watcher (`/new`, `/clear`) would linger
+    until its lifetime backstop: its session id never gets another hook run to
+    supersede it. Best-effort — a missing pidfile or an already-dead pid is
+    normal."""
+    pidfile = _watch_pidfile(session_id)
+    try:
+        pid = int(pidfile.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError:
+        pass
+    try:
+        pidfile.unlink()
     except OSError:
         pass
 
@@ -303,6 +520,16 @@ def report(payload: dict) -> bool:
     last_title = _read_text(_title_file(session_id))
     turns_path = _turns_file(session_id)
 
+    # Keep the /rename watcher daemon alive across the turn's hook runs (a
+    # rename fires no hook at all, so only a poller can deliver it while the
+    # session is idle). SessionEnd is the one event that must NOT spawn — it
+    # tears the watcher down instead, so an abandoned thread (/new, /clear)
+    # does not leave a daemon polling a name that can never change.
+    if event == "SessionEnd":
+        stop_watcher(session_id)
+    elif event in ("SessionStart", "UserPromptSubmit", "Stop"):
+        ensure_watcher(session_id, home)
+
     # SessionStart "clear" resets the conversation: drop the stale label and
     # the turn count, and report the reset (a placeholder title carries the
     # status; the new conversation's own first title takes over later).
@@ -333,6 +560,12 @@ def report(payload: dict) -> bool:
         return _emit(payload, title, f"Turn complete · {turns} {unit}", last_title)
 
     if event == "SessionEnd":
+        # An abandoned thread (/new, /clear) shares this pane's tmux context
+        # and resolves to ITS OWN stale title — emitting would rename the
+        # record back to a conversation that no longer exists. The watcher
+        # teardown above still happens for it.
+        if not is_current_generation(session_id):
+            return False
         return _emit(payload, title, "Session ended", last_title)
 
     if event == "SessionStart":

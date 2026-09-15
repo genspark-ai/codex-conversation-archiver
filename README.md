@@ -6,15 +6,18 @@ Codex session's **execution status** and **title** to
 Codex counterpart of [cc-conversation-archiver](https://github.com/genspark-ai/cc-conversation-archiver)'s
 status channel for Claude Code.
 
-This directory is the marketplace root, laid out to be pushed as-is to a
-public repo (the tmux-session bootstrap installs it with
-`codex plugin marketplace add genspark-ai/codex-conversation-archiver`):
+This directory is the marketplace root, published as
+[genspark-ai/codex-conversation-archiver](https://github.com/genspark-ai/codex-conversation-archiver)
+(the tmux-session bootstrap installs it with
+`codex plugin marketplace add genspark-ai/codex-conversation-archiver`) —
+this tree is the origin copy; keep the two in sync when touching the plugin:
 
 ```
 .claude-plugin/marketplace.json                       marketplace manifest (Codex reads the Claude layout)
 plugins/conversation-archiver/.codex-plugin/plugin.json
 plugins/conversation-archiver/hooks/hooks.json         lifecycle hooks (SessionStart / UserPromptSubmit / PostToolUse / Stop / SessionEnd)
-plugins/conversation-archiver/scripts/report.py        status + title reporting
+plugins/conversation-archiver/scripts/report.py        status + title reporting (hook-driven)
+plugins/conversation-archiver/scripts/title_watch.py   detached per-session title watcher (the /rename immediacy fix)
 plugins/conversation-archiver/scripts/notify.py        OSC 9999 emitter + tmux context (wire contract of GenTerminal's utils/osc.ts)
 plugins/conversation-archiver/tests/selftest.py       stdlib-only selftest (also run from CI via the Jest wrapper in the terminal repo)
 ```
@@ -32,7 +35,8 @@ sourceId:<session id>, event:"TitleChanged", title, body, tmux}`:
 | UserPromptSubmit| `Turn N started`                      | counts turns per session |
 | PostToolUse     | only on a title change                | a mid-turn Rename chat or the first derived title; plain tool activity never emits (no inbox spam) |
 | Stop            | `Turn complete · N turns`             | |
-| SessionEnd      | `Session ended`                       | |
+| SessionEnd      | `Session ended`                       | suppressed for an abandoned thread (`/new`, `/clear`) — it would carry the dead conversation's stale title |
+| title_watch daemon | `Session renamed`                  | an IDLE Rename chat, within ~1.5 s of the write; see below |
 
 ## Title resolution (same order as `codex resume`)
 
@@ -64,15 +68,31 @@ sorting when the tab is in the background.
 - **stdlib-only Python 3** — no dependencies to install.
 - **tmux-aware**: the sequence rides tmux's DCS passthrough, so it works in
   the panes GenTerminal manages (that is the primary deployment).
-- Opt out with `CODEX_ARCHIVER_NO_NOTIFY=1`.
+- Opt out with `CODEX_ARCHIVER_NO_NOTIFY=1`; opt out of the watcher daemon
+  alone with `CODEX_ARCHIVER_NO_WATCHER=1`.
 
-## Known gap (v1)
+## The `/rename` watcher (why a daemon exists)
 
-Codex fires NO hook on Rename chat, so a rename made while the session is
-IDLE reaches GenTerminal on the next hook event (next prompt / turn
-boundary), not within seconds. The Claude plugin closes this gap with a
-polling watcher daemon; a codex twin needs a process-liveness signal the
-hook payload does not carry yet.
+`/rename` (and `/clear` / `/new`) fire NO hook — verified against codex-rs
+(`HookEventName` has no rename variant) and live against codex-cli 0.154.0
+(`session_index.jsonl` gains the new name with zero hook invocations). So the
+hook-driven reporter can only deliver an idle rename on the NEXT hook event,
+i.e. the next prompt — which is exactly when a human renames.
+
+`report.ensure_watcher()` therefore spawns one detached `title_watch.py` per
+session from the ordinary hook runs (SessionStart / UserPromptSubmit / Stop,
+cheap pidfile + `kill(0)` probe). It polls `session_index.jsonl` every 1.5 s
+and pushes a name change through the same `notify.emit` + `<session>.title`
+marker path the hook reporter uses, so the two never double-report. It exits
+when superseded, when SessionEnd tears it down, when the codex process is
+gone, or at a 7-day lifetime backstop. POSIX only (`kill(0)` liveness); on
+Windows the hook cadence stays the only reporter.
+
+`/clear` and `/new` still cannot be reflected the instant they run: codex
+writes neither a rollout file nor an index entry until the new conversation's
+first turn, so there is no signal to watch. Both update the record at that
+first turn (the new prompt's title), and the previous thread's later
+SessionEnd is suppressed so it cannot rename the record back.
 
 ## Hook trust
 
@@ -89,7 +109,9 @@ marketplace.
 python3 plugins/conversation-archiver/tests/selftest.py
 ```
 
-Covers title resolution, event semantics/turn counting, the OSC 9999 wire
-contract captured from a real pty (the detached-hook shape), and hostile
-inputs. The terminal repo runs the same selftest from Jest
+Covers title resolution, event semantics/turn counting, the watcher daemon
+(index-name report, de-duplication with the hook reporter, supersede /
+generation / liveness exits, spawn-stop lifecycle), the OSC 9999 wire contract
+captured from a real pty (the detached-hook shape), and hostile inputs. The
+terminal repo runs the same selftest from Jest
 (`__tests__/codexArchiverPlugin.test.ts`).
